@@ -268,7 +268,7 @@ export default function Home() {
 
     try {
       const response = await fetch(
-        "https://YOUR-RENDER-URL.onrender.com/analyze",
+        "https://healthcare-digital-twin-2s36.onrender.com/analyze",
         {
           method: "POST",
           body: formData,
