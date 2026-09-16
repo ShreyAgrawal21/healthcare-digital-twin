@@ -79,10 +79,21 @@ def read_uploaded_file(file_bytes: bytes, filename: str) -> pd.DataFrame:
         # Excel
         elif filename_lower.endswith(".xlsx"):
 
-            df = pd.read_excel(
+            excel_file = pd.ExcelFile(
                 BytesIO(file_bytes),
                 engine="openpyxl"
             )
+
+            if "Longitudinal_Data" in excel_file.sheet_names:
+                df = pd.read_excel(
+                    excel_file,
+                    sheet_name="Longitudinal_Data"
+                )
+            else:
+                df = pd.read_excel(
+                    excel_file,
+                    sheet_name=excel_file.sheet_names[0]
+                )
 
         # Old Excel format
         elif filename_lower.endswith(".xls"):
@@ -125,11 +136,63 @@ def read_uploaded_file(file_bytes: bytes, filename: str) -> pd.DataFrame:
 
 def validate_columns(df: pd.DataFrame):
 
-    # Remove accidental spaces from column names
+    # ---------------------------------------------------------
+    # Normalize column names
+    # ---------------------------------------------------------
+
     df.columns = [
         str(column).strip().lower()
         for column in df.columns
     ]
+
+    # ---------------------------------------------------------
+    # Map shared DSC dataset → canonical engine schema
+    # ---------------------------------------------------------
+
+    column_mapping = {
+        "patient_id": "patient_id",
+        "patient_id ": "patient_id",
+
+        "date": "date",
+        "visit": "visit",
+
+        "egfr": "egfr",
+        "creatinine": "creatinine",
+        "uacr": "uacr",
+
+        "sbp": "systolic_bp",
+        "dbp": "diastolic_bp",
+
+        "hba1c": "hba1c",
+
+        "potassium": "potassium",
+        "hemoglobin": "hemoglobin",
+    }
+
+    df.rename(
+        columns=column_mapping,
+        inplace=True
+    )
+
+    # ---------------------------------------------------------
+    # Validate required columns
+    # ---------------------------------------------------------
+
+    missing_columns = [
+        column
+        for column in REQUIRED_COLUMNS
+        if column not in df.columns
+    ]
+
+    if missing_columns:
+
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Missing required columns",
+                "columns": missing_columns,
+            }
+        )
 
     missing_columns = [
         column
@@ -234,7 +297,6 @@ async def analyze(file: UploadFile = File(...)):
     # -----------------------------------------------------
 
     numeric_columns = [
-        "visit",
         "egfr",
         "creatinine",
         "uacr",

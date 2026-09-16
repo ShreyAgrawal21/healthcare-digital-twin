@@ -35,7 +35,7 @@ PARAMETERS = {
 # parameter to be considered consistently worsening.
 #
 # This is an ENGINE setting, NOT a clinical threshold.
-MIN_WORSENING_CONSISTENCY = 0.67
+MIN_WORSENING_CONSISTENCY = 2/3
 
 # Minimum number of parameters required to form
 # a multi-parameter worsening pattern.

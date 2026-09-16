@@ -6,7 +6,27 @@ from .config import (
     MIN_WORSENING_PARAMETERS
 )
 
+def normalize_visit_number(visit):
+    """
+    Convert visit labels such as:
+    1, 2, 3
+    V1, V2, V3
+    into numeric visit numbers.
+    """
 
+    if pd.isna(visit):
+        return None
+
+    visit_str = str(visit).strip()
+
+    if visit_str.upper().startswith("V"):
+        visit_str = visit_str[1:]
+
+    try:
+        return int(float(visit_str))
+    except (ValueError, TypeError):
+        return None
+    
 # ============================================================
 # 1. CALCULATE LONGITUDINAL CHANGES
 # ============================================================
@@ -487,12 +507,12 @@ def detect_co_worsening(
         transition_results.append({
 
             "from_visit":
-                int(
+                normalize_visit_number(
                     previous["visit"]
                 ),
 
             "to_visit":
-                int(
+                normalize_visit_number(
                     current["visit"]
                 ),
 
@@ -582,7 +602,7 @@ def build_patient_timeline(
                 ),
 
             "visit":
-                int(row["visit"])
+                normalize_visit_number(row["visit"])
         }
 
         # Add configured parameters
@@ -635,7 +655,7 @@ def build_change_history(
                 ),
 
             "visit":
-                int(row["visit"]),
+                normalize_visit_number(row["visit"]),
 
             "changes": {}
         }
@@ -1143,6 +1163,374 @@ def build_parameter_evidence(
 
     return evidence
 
+# ============================================================
+# 11.5 BUILD LONGITUDINAL FEATURES
+# ============================================================
+
+def calculate_longitudinal_features(patient_df: pd.DataFrame):
+    """
+    Generate reusable patient-level longitudinal features
+    for downstream prediction and explainability models.
+
+    Features include:
+    - Baseline value
+    - Latest value
+    - Absolute change
+    - Percentage change
+    - Visit-to-visit rate
+    - Longitudinal slope
+    - Variability
+    - Acceleration
+    - Overall trend
+
+    IMPORTANT:
+    These are statistical longitudinal features only.
+    They do not represent clinical thresholds, diagnosis,
+    prognosis, or causal relationships.
+    """
+
+    patient_df = (
+        patient_df
+        .sort_values("date")
+        .reset_index(drop=True)
+    )
+
+    features = {}
+
+    for parameter in PARAMETERS:
+
+        values = pd.to_numeric(
+            patient_df[parameter],
+            errors="coerce"
+        )
+
+        valid = pd.DataFrame({
+            "date": patient_df["date"],
+            "value": values
+        }).dropna()
+
+        # ----------------------------------------------------
+        # Not enough data
+        # ----------------------------------------------------
+
+        if len(valid) == 0:
+            features[parameter] = {
+                "baseline": None,
+                "latest": None,
+                "absolute_change": None,
+                "percentage_change": None,
+                "slope_per_day": None,
+                "slope_per_year": None,
+                "variability_std": None,
+                "average_rate_per_day": None,
+                "acceleration": None,
+                "trend": "insufficient_data"
+            }
+            continue
+
+        # ----------------------------------------------------
+        # Basic values
+        # ----------------------------------------------------
+
+        baseline = float(valid["value"].iloc[0])
+        latest = float(valid["value"].iloc[-1])
+
+        absolute_change = latest - baseline
+
+        if baseline != 0:
+            percentage_change = (
+                absolute_change / abs(baseline)
+            ) * 100
+        else:
+            percentage_change = None
+
+        # ----------------------------------------------------
+        # Time in days from baseline
+        # ----------------------------------------------------
+
+        days = (
+            valid["date"] - valid["date"].iloc[0]
+        ).dt.days.astype(float)
+
+        values_list = valid["value"].astype(float)
+
+        # ----------------------------------------------------
+        # Longitudinal slope
+        #
+        # Simple least-squares regression:
+        # value = intercept + slope * time
+        # ----------------------------------------------------
+
+        if len(valid) >= 2 and days.iloc[-1] != 0:
+
+            x_mean = days.mean()
+            y_mean = values_list.mean()
+
+            numerator = (
+                (days - x_mean) *
+                (values_list - y_mean)
+            ).sum()
+
+            denominator = (
+                (days - x_mean) ** 2
+            ).sum()
+
+            if denominator != 0:
+                slope_per_day = numerator / denominator
+            else:
+                slope_per_day = None
+
+        else:
+            slope_per_day = None
+
+        # Convert slope to approximate yearly rate.
+        if slope_per_day is not None:
+            slope_per_year = slope_per_day * 365.25
+        else:
+            slope_per_year = None
+
+        # ----------------------------------------------------
+        # Variability
+        # ----------------------------------------------------
+
+        if len(values_list) >= 2:
+            variability_std = values_list.std(ddof=1)
+        else:
+            variability_std = 0.0
+
+        # ----------------------------------------------------
+        # Visit-to-visit rates
+        # ----------------------------------------------------
+
+        visit_rates = []
+
+        for index in range(1, len(valid)):
+
+            previous_value = float(
+                valid["value"].iloc[index - 1]
+            )
+
+            current_value = float(
+                valid["value"].iloc[index]
+            )
+
+            days_between = (
+                valid["date"].iloc[index]
+                - valid["date"].iloc[index - 1]
+            ).days
+
+            if days_between > 0:
+
+                rate = (
+                    current_value - previous_value
+                ) / days_between
+
+                visit_rates.append({
+                    "rate": rate,
+                    "midpoint_day": (
+                        days.iloc[index - 1]
+                        + days.iloc[index]
+                    ) / 2
+                })
+
+        if visit_rates:
+            average_rate_per_day = sum(
+                item["rate"]
+                for item in visit_rates
+            ) / len(visit_rates)
+        else:
+            average_rate_per_day = None
+
+        # ----------------------------------------------------
+        # Acceleration
+        #
+        # Acceleration is the change in rate over time.
+        #
+        # Requires at least 3 transitions.
+        # ----------------------------------------------------
+
+        acceleration = None
+
+        if len(visit_rates) >= 3:
+
+            rate_x = pd.Series(
+                [
+                    item["midpoint_day"]
+                    for item in visit_rates
+                ],
+                dtype=float
+            )
+
+            rate_y = pd.Series(
+                [
+                    item["rate"]
+                    for item in visit_rates
+                ],
+                dtype=float
+            )
+
+            rate_x_mean = rate_x.mean()
+            rate_y_mean = rate_y.mean()
+
+            numerator = (
+                (rate_x - rate_x_mean) *
+                (rate_y - rate_y_mean)
+            ).sum()
+
+            denominator = (
+                (rate_x - rate_x_mean) ** 2
+            ).sum()
+
+            if denominator != 0:
+                acceleration = numerator / denominator
+
+        # ----------------------------------------------------
+        # Overall trend
+        # ----------------------------------------------------
+
+        changes = (
+            values_list.diff()
+            .dropna()
+        )
+
+        if len(changes) == 0:
+            trend = "insufficient_data"
+
+        else:
+            increasing_steps = int(
+                (changes > 0).sum()
+            )
+
+            decreasing_steps = int(
+                (changes < 0).sum()
+            )
+
+            stable_steps = int(
+                (changes == 0).sum()
+            )
+
+            # A dominant direction is only assigned when
+            # one direction has more transitions than the other.
+            if (
+                increasing_steps > decreasing_steps
+                and increasing_steps > stable_steps
+            ):
+                trend = "increasing"
+
+            elif (
+                decreasing_steps > increasing_steps
+                and decreasing_steps > stable_steps
+            ):
+                trend = "decreasing"
+
+            elif stable_steps > max(
+                increasing_steps,
+                decreasing_steps
+            ):
+                trend = "stable"
+
+            else:
+                trend = "fluctuating"
+
+        # ----------------------------------------------------
+        # Store features
+        # ----------------------------------------------------
+
+        features[parameter] = {
+            "baseline": round(baseline, 4),
+            "latest": round(latest, 4),
+
+            "absolute_change": round(
+                absolute_change,
+                4
+            ),
+
+            "percentage_change": (
+                round(percentage_change, 4)
+                if percentage_change is not None
+                else None
+            ),
+
+            "slope_per_day": (
+                round(float(slope_per_day), 8)
+                if slope_per_day is not None
+                else None
+            ),
+
+            "slope_per_year": (
+                round(float(slope_per_year), 4)
+                if slope_per_year is not None
+                else None
+            ),
+
+            "variability_std": round(
+                float(variability_std),
+                4
+            ),
+
+            "average_rate_per_day": (
+                round(
+                    float(average_rate_per_day),
+                    8
+                )
+                if average_rate_per_day is not None
+                else None
+            ),
+
+            "acceleration": (
+                round(
+                    float(acceleration),
+                    10
+                )
+                if acceleration is not None
+                else None
+            ),
+
+            "trend": trend
+        }
+
+    # --------------------------------------------------------
+    # Patient-level multi-signal features
+    # --------------------------------------------------------
+
+    worsening_signals = detect_worsening_signals(
+        patient_df
+    )
+
+    co_worsening = detect_co_worsening(
+        patient_df
+    )
+
+    features["_patient_level"] = {
+        "worsening_signal_count": len(
+            worsening_signals
+        ),
+
+        "worsening_parameters": [
+            signal["parameter"]
+            for signal in worsening_signals
+        ],
+
+        "multi_signal_deterioration": (
+            len(worsening_signals)
+            >= MIN_WORSENING_PARAMETERS
+        ),
+
+        "concurrent_worsening_detected": (
+            co_worsening[
+                "co_worsening_detected"
+            ]
+        ),
+
+        "concurrent_worsening_transition_count": len(
+            co_worsening[
+                "co_worsening_transitions"
+            ]
+        )
+    }
+
+    return features
+
 
 # ============================================================
 # 12. COMPLETE PATIENT ANALYSIS
@@ -1273,6 +1661,7 @@ def analyze_patient(
     else:
 
         overall_status = (
+            "Mixed / fluctuating longitudinal pattern."
             "No multi-parameter worsening "
             "pattern detected."
         )
@@ -1305,6 +1694,14 @@ def analyze_patient(
             analyzed_df,
             worsening_signals
         )
+    )
+    
+    # --------------------------------------------
+    # 11. Longitudinal feature generation
+    # --------------------------------------------
+
+    longitudinal_features = calculate_longitudinal_features(
+        analyzed_df
     )
 
     # --------------------------------------------
@@ -1345,6 +1742,9 @@ def analyze_patient(
 
         "parameter_evidence":
             parameter_evidence,
+        
+        "longitudinal_features":
+            longitudinal_features,
 
         "explanation":
             explanations,
