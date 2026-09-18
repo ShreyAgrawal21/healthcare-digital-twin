@@ -281,34 +281,48 @@ def detect_worsening_signals(
     Identify parameters that consistently move
     in their configured worsening direction.
 
-    IMPORTANT:
-    This function performs longitudinal pattern
-    detection only.
+    Missing parameter observations are skipped rather than
+    converted into NaN output values. Transitions are calculated
+    between consecutive valid observations for that parameter.
 
+    IMPORTANT:
+    This function performs longitudinal pattern detection only.
     It does NOT apply clinical thresholds.
     """
 
     worsening = []
 
-    # Number of possible transitions
-    total_transitions = (
-        len(patient_df) - 1
-    )
-
-    if total_transitions <= 0:
-        return worsening
-
     for parameter, metadata in PARAMETERS.items():
 
-        # Visit-to-visit changes
+        # Keep only valid observations for this parameter.
+        # This supports partial-parameter test cases without
+        # producing non-JSON-compliant NaN values.
+        valid = patient_df[
+            ["date", "visit", parameter]
+        ].copy()
+
+        valid[parameter] = pd.to_numeric(
+            valid[parameter],
+            errors="coerce"
+        )
+
+        valid = (
+            valid
+            .dropna(subset=[parameter])
+            .sort_values("date")
+            .reset_index(drop=True)
+        )
+
+        # At least two valid observations are needed for
+        # a visit-to-visit worsening pattern.
+        if len(valid) < 2:
+            continue
+
         changes = (
-            patient_df[parameter]
+            valid[parameter]
             .diff()
             .dropna()
         )
-
-        # Remove missing changes
-        changes = changes.dropna()
 
         if len(changes) == 0:
             continue
@@ -317,54 +331,32 @@ def detect_worsening_signals(
             "worsening_direction"
         ]
 
-        # ----------------------------------------
-        # Count worsening transitions
-        # ----------------------------------------
-
         if expected_direction == "decreasing":
-
             worsening_steps = int(
                 (changes < 0).sum()
             )
 
         elif expected_direction == "increasing":
-
             worsening_steps = int(
                 (changes > 0).sum()
             )
 
         else:
-
             continue
-
-        # ----------------------------------------
-        # Calculate consistency
-        # ----------------------------------------
 
         consistency = (
             worsening_steps
             / len(changes)
         )
 
-        # ----------------------------------------
-        # Overall change
-        # ----------------------------------------
-
+        # Both values are guaranteed to be valid because
+        # they come from the filtered parameter series.
         overall_change = (
-            patient_df[parameter].iloc[-1]
-            -
-            patient_df[parameter].iloc[0]
+            float(valid[parameter].iloc[-1])
+            - float(valid[parameter].iloc[0])
         )
 
-        # ----------------------------------------
-        # Add worsening signal
-        # ----------------------------------------
-
-        if (
-            consistency
-            >= MIN_WORSENING_CONSISTENCY
-        ):
-
+        if consistency >= MIN_WORSENING_CONSISTENCY:
             worsening.append({
 
                 "parameter":
@@ -390,9 +382,7 @@ def detect_worsening_signals(
 
                 "overall_change":
                     round(
-                        float(
-                            overall_change
-                        ),
+                        overall_change,
                         4
                     )
             })
