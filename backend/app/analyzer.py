@@ -28,6 +28,22 @@ def normalize_visit_number(visit):
         return None
     
 # ============================================================
+# LONGITUDINAL FEATURE MINIMUM OBSERVATION REQUIREMENTS
+# ============================================================
+
+MIN_OBSERVATIONS = {
+    "baseline": 1,
+    "latest": 1,
+    "absolute_change": 1,
+    "percentage_change": 1,
+    "slope": 2,
+    "average_rate": 2,
+    "variability": 2,
+    "trend": 2,
+    "acceleration": 4,
+}
+    
+# ============================================================
 # 1. CALCULATE LONGITUDINAL CHANGES
 # ============================================================
 
@@ -743,6 +759,17 @@ def safe_float(value):
         float(value),
         4
     )
+    
+def feature_not_calculable(reason):
+    """
+    Return a consistent representation for a longitudinal
+    feature that cannot be calculated from the available history.
+    """
+    return {
+        "value": None,
+        "status": "not_calculable",
+        "reason": reason,
+    }
 
 
 # ============================================================
@@ -1242,7 +1269,10 @@ def calculate_longitudinal_features(patient_df: pd.DataFrame):
                 absolute_change / abs(baseline)
             ) * 100
         else:
-            percentage_change = None
+            percentage_change = feature_not_calculable(
+                "Baseline value is zero, "
+                "percentage change is undefined."
+            )
 
         # ----------------------------------------------------
         # Time in days from baseline
@@ -1296,7 +1326,7 @@ def calculate_longitudinal_features(patient_df: pd.DataFrame):
         if len(values_list) >= 2:
             variability_std = values_list.std(ddof=1)
         else:
-            variability_std = 0.0
+            variability_std = None
 
         # ----------------------------------------------------
         # Visit-to-visit rates
@@ -1446,26 +1476,36 @@ def calculate_longitudinal_features(patient_df: pd.DataFrame):
             ),
 
             "percentage_change": (
-                round(percentage_change, 4)
-                if percentage_change is not None
-                else None
+                percentage_change
+                if isinstance(percentage_change, dict)
+                else round(percentage_change, 4)
             ),
 
             "slope_per_day": (
                 round(float(slope_per_day), 8)
                 if slope_per_day is not None
-                else None
+                else feature_not_calculable(
+                    "Insufficient observations: at least 2 valid observations "
+                    "on distinct dates are required."
+                )
             ),
 
             "slope_per_year": (
                 round(float(slope_per_year), 4)
                 if slope_per_year is not None
-                else None
+                else feature_not_calculable(
+                    "Insufficient observations: at least 2 valid observations "
+                    "on distinct dates are required."
+                )
             ),
 
-            "variability_std": round(
-                float(variability_std),
-                4
+            "variability_std": (
+                round(float(variability_std), 4)
+                if variability_std is not None
+                else feature_not_calculable(
+                    "Insufficient observations: at least 2 valid observations "
+                    "are required to calculate variability."
+                )
             ),
 
             "average_rate_per_day": (
@@ -1474,7 +1514,10 @@ def calculate_longitudinal_features(patient_df: pd.DataFrame):
                     8
                 )
                 if average_rate_per_day is not None
-                else None
+                else feature_not_calculable(
+                    "Insufficient observations: at least 2 valid observations "
+                    "on distinct dates are required to calculate visit-to-visit rates."
+                )
             ),
 
             "acceleration": (
@@ -1483,10 +1526,20 @@ def calculate_longitudinal_features(patient_df: pd.DataFrame):
                     10
                 )
                 if acceleration is not None
-                else None
+                else feature_not_calculable(
+                    "Insufficient observations: at least 3 valid visit-to-visit rates "
+                    "are required to calculate acceleration."
+                )
             ),
 
-            "trend": trend
+            "trend": (
+                trend
+                if trend != "insufficient_data"
+                else feature_not_calculable(
+                    "Insufficient observations: at least 2 valid observations "
+                    "on distinct dates are required to determine trend."
+                )
+            )
         }
 
     # --------------------------------------------------------
@@ -1500,6 +1553,24 @@ def calculate_longitudinal_features(patient_df: pd.DataFrame):
     co_worsening = detect_co_worsening(
         patient_df
     )
+
+    # --------------------------------------------------------
+    # Patient-level history availability
+    # --------------------------------------------------------
+    # The current acceleration implementation requires three
+    # valid visit-to-visit rates, which means four valid visits.
+    # P070-P075 intentionally contain two visits each and are
+    # therefore treated as incomplete-follow-up test cases.
+    valid_visit_count = len(
+        patient_df[["date"]].dropna()
+    )
+
+    incomplete_follow_up = valid_visit_count < 4
+
+    insufficient_history_features = []
+
+    if valid_visit_count < 4:
+        insufficient_history_features.append("acceleration")
 
     features["_patient_level"] = {
         "worsening_signal_count": len(
@@ -1526,7 +1597,11 @@ def calculate_longitudinal_features(patient_df: pd.DataFrame):
             co_worsening[
                 "co_worsening_transitions"
             ]
-        )
+        ),
+
+        "incomplete_follow_up": incomplete_follow_up,
+
+        "insufficient_history_features": insufficient_history_features
     }
 
     return features
