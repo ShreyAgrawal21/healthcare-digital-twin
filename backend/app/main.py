@@ -1,8 +1,11 @@
 from io import BytesIO
+from uuid import uuid4
 
 import pandas as pd
 from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from app.feature_table import build_patient_feature_table
 
 from app.analyzer import calculate_changes, analyze_patient, normalize_visit_number
 
@@ -12,6 +15,17 @@ app = FastAPI(
     description="Longitudinal healthcare data intelligence engine",
     version="1.0.0"
 )
+
+
+# ---------------------------------------------------------
+# POC export cache
+# ---------------------------------------------------------
+# Stores the most recently generated patient-level feature table
+# so CSV/XLSX exports can be downloaded without recalculating
+# longitudinal features. This is intentionally in-memory for the
+# POC; production deployment should use persistent/object storage
+# and an analysis/job identifier.
+LAST_FEATURE_TABLES = {}
 
 
 # ---------------------------------------------------------
@@ -595,9 +609,130 @@ async def analyze(file: UploadFile = File(...)):
     # Final response
     # -----------------------------------------------------
 
+    # Build the integration-ready patient-level feature table.
+    # This only flattens existing analyzer output; it does not
+    # recalculate longitudinal features.
+    patient_results = {
+        str(result["patient_id"]): result
+        for result in results
+    }
+
+    patient_quality_flags = {}
+
+    for result in results:
+        patient_id = str(result["patient_id"])
+        quality_info = result.get("data_quality", {})
+
+        patient_quality_flags[patient_id] = {
+            "quality_status": quality_info.get(
+                "quality_status",
+                "ok"
+            ),
+            "flags": quality_info.get(
+                "flags",
+                []
+            ),
+        }
+
+    feature_table_quality_report = {
+        "patient_flags": patient_quality_flags
+    }
+
+    patient_feature_table = build_patient_feature_table(
+        patient_results=patient_results,
+        quality_report=feature_table_quality_report,
+    )
+
+    # Convert pandas NaN values to JSON null.
+    patient_feature_records = (
+        patient_feature_table
+        .astype(object)
+        .where(pd.notna(patient_feature_table), None)
+        .to_dict(orient="records")
+    )
+
+    # Create an analysis id so the generated feature table can be
+    # exported later without running the analyzer again.
+    analysis_id = str(uuid4())
+    LAST_FEATURE_TABLES[analysis_id] = patient_feature_table.copy()
+
+    # Keep the POC cache bounded to the latest 10 analyses.
+    while len(LAST_FEATURE_TABLES) > 10:
+        oldest_id = next(iter(LAST_FEATURE_TABLES))
+        del LAST_FEATURE_TABLES[oldest_id]
+
     return {
+        "analysis_id": analysis_id,
         "patients_analyzed": len(results),
         "records_processed": len(df),
         "file_name": file.filename,
+        "data_quality": data_quality,
+        "patient_feature_table": patient_feature_records,
         "results": results,
+        "export_endpoints": {
+            "csv": f"/feature-table/{analysis_id}/csv",
+            "xlsx": f"/feature-table/{analysis_id}/xlsx",
+        },
     }
+
+
+# ---------------------------------------------------------
+# Feature table export endpoints
+# ---------------------------------------------------------
+
+def get_feature_table_or_404(analysis_id: str) -> pd.DataFrame:
+    feature_table = LAST_FEATURE_TABLES.get(analysis_id)
+
+    if feature_table is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Analysis not found or its export cache has expired. Run /analyze again."
+        )
+
+    return feature_table
+
+
+@app.get("/feature-table/{analysis_id}/csv")
+def export_feature_table_csv(analysis_id: str):
+    feature_table = get_feature_table_or_404(analysis_id)
+
+    csv_buffer = BytesIO()
+    feature_table.to_csv(csv_buffer, index=False)
+    csv_buffer.seek(0)
+
+    return StreamingResponse(
+        csv_buffer,
+        media_type="text/csv",
+        headers={
+            "Content-Disposition":
+                f'attachment; filename="patient_feature_table_{analysis_id}.csv"'
+        },
+    )
+
+
+@app.get("/feature-table/{analysis_id}/xlsx")
+def export_feature_table_xlsx(analysis_id: str):
+    feature_table = get_feature_table_or_404(analysis_id)
+
+    xlsx_buffer = BytesIO()
+
+    with pd.ExcelWriter(xlsx_buffer, engine="openpyxl") as writer:
+        feature_table.to_excel(
+            writer,
+            index=False,
+            sheet_name="Patient Feature Table"
+        )
+
+    xlsx_buffer.seek(0)
+
+    return StreamingResponse(
+        xlsx_buffer,
+        media_type=(
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"
+        ),
+        headers={
+            "Content-Disposition":
+                f'attachment; filename="patient_feature_table_{analysis_id}.xlsx"'
+        },
+    )
