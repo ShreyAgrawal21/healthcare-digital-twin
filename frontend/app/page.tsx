@@ -33,11 +33,31 @@ interface Explanation {
   to_visit?: number;
 }
 
+interface FeatureValue {
+  value: number | string | null;
+  status?: string;
+  reason?: string;
+}
+
+interface LongitudinalParameterFeatures {
+  baseline?: FeatureValue | number | null;
+  latest?: FeatureValue | number | null;
+  absolute_change?: FeatureValue | number | null;
+  percentage_change?: FeatureValue | number | null;
+  slope_per_day?: FeatureValue | number | null;
+  slope_per_year?: FeatureValue | number | null;
+  variability_std?: FeatureValue | number | null;
+  average_rate_per_day?: FeatureValue | number | null;
+  acceleration?: FeatureValue | number | null;
+  trend?: FeatureValue | string | null;
+}
+
 interface PatientResult {
   patient_id: string;
   number_of_visits: number;
   timeline: TimelineItem[];
   trends: Record<string, TrendData>;
+  longitudinal_features?: Record<string, LongitudinalParameterFeatures>;
 
   worsening_signal_count: number;
   worsening_signals: WorseningSignal[];
@@ -84,10 +104,15 @@ interface PatientResult {
 }
 
 interface AnalysisResponse {
+  analysis_id?: string;
   patients_analyzed: number;
   records_processed?: number;
   file_name?: string;
   results: PatientResult[];
+  export_endpoints?: {
+    csv?: string;
+    xlsx?: string;
+  };
 }
 
 const parameterNames: Record<string, string> = {
@@ -127,6 +152,74 @@ function getTrendClass(trend: string) {
   if (trend === "decreasing") return "trend-down";
   if (trend === "stable") return "trend-stable";
   return "";
+}
+
+function isNotCalculable(
+  value: unknown
+): value is {
+  value: null;
+  status: "not_calculable";
+  reason?: string;
+} {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "status" in value &&
+    (value as { status?: string }).status === "not_calculable"
+  );
+}
+
+function getFeatureValue(value: unknown): number | string | null {
+  if (typeof value === "object" && value !== null && "value" in value) {
+    return (value as { value?: number | string | null }).value ?? null;
+  }
+
+  if (typeof value === "number" || typeof value === "string") {
+    return value;
+  }
+
+  return null;
+}
+
+function formatFeatureValue(value: unknown, decimals = 4) {
+  if (isNotCalculable(value)) {
+    return "Not calculable";
+  }
+
+  const resolved = getFeatureValue(value);
+
+  if (resolved === null || resolved === undefined || resolved === "") {
+    return "—";
+  }
+
+  if (typeof resolved === "number") {
+    return resolved
+      .toFixed(decimals)
+      .replace(/\.?0+$/, "");
+  }
+
+  return String(resolved);
+}
+
+function renderFeatureValue(
+  value: unknown,
+  label = "Feature unavailable"
+) {
+  if (isNotCalculable(value)) {
+    return (
+      <div
+        className="feature-not-calculable"
+        title={value.reason || "Insufficient valid observations."}
+      >
+        <strong>{label}: Not calculable</strong>
+        <small>
+          {value.reason || "Insufficient valid observations."}
+        </small>
+      </div>
+    );
+  }
+
+  return <span>{formatFeatureValue(value)}</span>;
 }
 
 /*
@@ -198,6 +291,9 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
 
   const [error, setError] = useState("");
+
+  const [downloadLoading, setDownloadLoading] =
+    useState<"csv" | "xlsx" | null>(null);
 
   /*
    * -------------------------------------------------------
@@ -300,6 +396,70 @@ export default function Home() {
       );
     } finally {
       setLoading(false);
+    }
+  }
+
+  /*
+   * -------------------------------------------------------
+   * Feature table export
+   * -------------------------------------------------------
+   */
+
+  async function downloadFeatureTable(format: "csv" | "xlsx") {
+    if (!data?.analysis_id) {
+      setError("No analysis ID is available. Please analyze the dataset again.");
+      return;
+    }
+
+    setDownloadLoading(format);
+    setError("");
+
+    try {
+      const response = await fetch(
+        `https://healthcare-digital-twin-2s36.onrender.com/feature-table/${data.analysis_id}/${format}`,
+        {
+          method: "GET",
+        }
+      );
+
+      if (!response.ok) {
+        let message = `Unable to download ${format.toUpperCase()} feature table.`;
+
+        try {
+          const result = await response.json();
+          message =
+            result.detail?.message ||
+            result.detail ||
+            message;
+        } catch {
+          // Keep the default message when the response is not JSON.
+        }
+
+        throw new Error(message);
+      }
+
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement("a");
+
+      link.href = url;
+      link.download =
+        format === "xlsx"
+          ? `patient_feature_table_${data.analysis_id}.xlsx`
+          : `patient_feature_table_${data.analysis_id}.csv`;
+
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : `Unable to download ${format.toUpperCase()} feature table.`
+      );
+    } finally {
+      setDownloadLoading(null);
     }
   }
 
@@ -499,6 +659,76 @@ export default function Home() {
 
 
           {/* ===============================================
+              FEATURE TABLE EXPORT
+          =============================================== */}
+
+          <section className="card">
+            <div className="section-heading">
+              <div>
+                <p className="section-label">
+                  DATA EXPORT
+                </p>
+
+                <h2>
+                  Patient Feature Table
+                </h2>
+
+                <p>
+                  Download the calculated patient-level longitudinal
+                  features for downstream analysis and integration.
+                </p>
+              </div>
+            </div>
+
+            <div
+              style={{
+                display: "flex",
+                gap: "12px",
+                flexWrap: "wrap",
+                alignItems: "center",
+              }}
+            >
+              <button
+                className="primary-button"
+                onClick={() => downloadFeatureTable("csv")}
+                disabled={
+                  !data.analysis_id ||
+                  downloadLoading !== null
+                }
+              >
+                {downloadLoading === "csv"
+                  ? "Preparing CSV..."
+                  : "Download CSV"}
+              </button>
+
+              <button
+                className="primary-button"
+                onClick={() => downloadFeatureTable("xlsx")}
+                disabled={
+                  !data.analysis_id ||
+                  downloadLoading !== null
+                }
+              >
+                {downloadLoading === "xlsx"
+                  ? "Preparing Excel..."
+                  : "Download Excel"}
+              </button>
+
+              {data.analysis_id && (
+                <small
+                  style={{
+                    opacity: 0.7,
+                    wordBreak: "break-all",
+                  }}
+                >
+                  Analysis ID: {data.analysis_id}
+                </small>
+              )}
+            </div>
+          </section>
+
+
+          {/* ===============================================
               PATIENT SELECTOR
           =============================================== */}
 
@@ -630,6 +860,42 @@ export default function Home() {
 
               </section>
 
+
+              {(() => {
+                const patientWithFlags = patient as PatientResult & {
+                  incomplete_follow_up?: boolean;
+                  insufficient_history_features?: string[];
+                };
+
+                if (!patientWithFlags.incomplete_follow_up) {
+                  return null;
+                }
+
+                return (
+                  <section className="card">
+                    <div className="data-quality-warning">
+                      <div>
+                        <strong>Incomplete follow-up</strong>
+                        <p>
+                          This patient has {patient.number_of_visits} valid
+                          visits. Some longitudinal features cannot be
+                          calculated with the available history.
+                        </p>
+
+                        {patientWithFlags.insufficient_history_features &&
+                          patientWithFlags.insufficient_history_features.length > 0 && (
+                            <small>
+                              Insufficient-history features:{" "}
+                              {patientWithFlags.insufficient_history_features
+                                .map(formatParameter)
+                                .join(", ")}
+                            </small>
+                          )}
+                      </div>
+                    </div>
+                  </section>
+                );
+              })()}
 
               {/* =============================================
                   TIMELINE
@@ -883,6 +1149,118 @@ export default function Home() {
 
               </section>
 
+
+              {/* =============================================
+                  LONGITUDINAL TECHNICAL FEATURES
+              ============================================= */}
+
+              {patient.longitudinal_features && (
+                <section className="card">
+                  <div className="section-heading">
+                    <div>
+                      <p className="section-label">
+                        LONGITUDINAL FEATURES
+                      </p>
+                      <h2>Technical Feature Summary</h2>
+                      <p>
+                        Statistical features generated from repeated
+                        patient observations.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="table-wrapper">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Parameter</th>
+                          <th>Slope / Day</th>
+                          <th>Slope / Year</th>
+                          <th>Variability</th>
+                          <th>Average Rate / Day</th>
+                          <th>Acceleration</th>
+                          <th>Trend</th>
+                        </tr>
+                      </thead>
+
+                      <tbody>
+                        {Object.entries(
+                          patient.longitudinal_features
+                        ).map(([parameter, features]) => (
+                          <tr key={parameter}>
+                            <td>
+                              <strong>
+                                {formatParameter(parameter)}
+                              </strong>
+                              <small>
+                                {parameterUnits[parameter] || ""}
+                              </small>
+                            </td>
+
+                            <td>
+                              {renderFeatureValue(
+                                features.slope_per_day
+                              )}
+                            </td>
+
+                            <td>
+                              {renderFeatureValue(
+                                features.slope_per_year
+                              )}
+                            </td>
+
+                            <td>
+                              {renderFeatureValue(
+                                features.variability_std
+                              )}
+                            </td>
+
+                            <td>
+                              {renderFeatureValue(
+                                features.average_rate_per_day
+                              )}
+                            </td>
+
+                            <td>
+                              {renderFeatureValue(
+                                features.acceleration,
+                                "Acceleration"
+                              )}
+                            </td>
+
+                            <td>
+                              {renderFeatureValue(
+                                features.trend,
+                                "Trend"
+                              )}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+
+                  <div className="feature-note">
+                    <strong>
+                      Unavailable features are not treated as zero.
+                    </strong>
+                    <span>
+                      When the required observations are unavailable,
+                      the engine returns a null value with a reason.
+                    </span>
+                  </div>
+
+                  <div className="feature-note">
+                    <strong>
+                      Integration-ready export
+                    </strong>
+                    <span>
+                      The same patient-level feature table can be downloaded
+                      as CSV or Excel using the export controls above.
+                    </span>
+                  </div>
+                </section>
+              )}
 
               {/* =============================================
                   WORSENING SIGNALS
